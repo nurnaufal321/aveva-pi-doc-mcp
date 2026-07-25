@@ -126,4 +126,4 @@ This project is not affiliated with, endorsed by, or supported by AVEVA. It prox
 
 ## License
 
-MIT © Naufal — see [LICENSE](LICENSE)
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for detils.
