@@ -5,25 +5,17 @@ PI System documentation without hallucinating. Scoped strictly to
 https://docs.aveva.com/category/pi-system.
 """
 
-import asyncio
 import re
-from typing import Any
+from typing import Annotated
 from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.server.mcpserver.server import MCPServer
 
 BASE_API = "https://docs-be.aveva.com"
 
-# Exhaustive whitelist of bundle IDs under docs.aveva.com/category/pi-system.
-# Grouped by the category page's four sections. Prevents results from leaking
-# into System Platform, CONNECT, or other AVEVA product families.
 # Pattern that matches ANY bundle under docs.aveva.com/category/pi-system.
-# Using a regex allows versioned IDs (e.g. pi-powershell-2.2.3, pi-server-f-2024)
-# without maintaining an exhaustive exact-match list.
 _PI_BUNDLE_PATTERN = re.compile(
     r"^("
     r"pi-server|pi-web-api|pi-vision|pi-datalink|pi-sql|pi-oledb"
@@ -36,8 +28,6 @@ _PI_BUNDLE_PATTERN = re.compile(
     r")"
 )
 
-# Explicit exclusions — bundles that match the pattern above but are NOT
-# under /category/pi-system (e.g. CONNECT or System Platform products).
 _PI_BUNDLE_EXCLUDE: frozenset[str] = frozenset({
     "connect-to-pi-agent",
     "edna-to-pi-migration-utility",
@@ -51,8 +41,6 @@ def is_pi_system_bundle(bundle_id: str) -> bool:
     )
 
 
-# Exhaustive whitelist of bundle IDs under docs.aveva.com/category/pi-system.
-# Used only for list_pi_bundles display grouping.
 PI_SYSTEM_BUNDLES: frozenset[str] = frozenset({
     # PI Server (2024 R2 / Windows)
     "pi-server-f", "pi-server-f-install", "pi-server-f-da-smt",
@@ -124,7 +112,6 @@ PI_SYSTEM_BUNDLES: frozenset[str] = frozenset({
     "pi-system-connector", "pi-system-connector-3",
 })
 
-# Bundle groups for list_pi_bundles output
 _BUNDLE_GROUPS: list[tuple[str, list[str]]] = [
     ("PI Server", sorted(b for b in PI_SYSTEM_BUNDLES if "pi-server" in b)),
     ("PI Web API", sorted(b for b in PI_SYSTEM_BUNDLES if "pi-web-api" in b or "omf-with-pi" in b)),
@@ -138,10 +125,11 @@ _BUNDLE_GROUPS: list[tuple[str, list[str]]] = [
     ("PowerShell / Other", sorted(b for b in PI_SYSTEM_BUNDLES if b in ("pi-system-connector", "pi-system-connector-3", "pi-opc-ua-server", "pi-cloud-connect", "pi-autopointsync", "pi-event-frames-generator", "pi-to-connect-agent", "pi-to-connect-agent-event-frames-preview"))),
 ]
 
-app = Server("pi-doc-mcp")
+# ── App ────────────────────────────────────────────────────────────────────────
 
+mcp = MCPServer("pi-doc-mcp")
 _client: httpx.AsyncClient | None = None
-_bundle_list_cache: str | None = None  # cached text output of list_pi_bundles
+_bundle_list_cache: str | None = None
 
 
 def get_client() -> httpx.AsyncClient:
@@ -150,6 +138,8 @@ def get_client() -> httpx.AsyncClient:
         _client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
     return _client
 
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def html_to_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
@@ -162,7 +152,6 @@ def html_to_text(html: str) -> str:
 
 
 def bundle_url_to_api(url: str) -> tuple[str, str] | None:
-    """Return (api_url, bundle_id) or None if URL is unparseable."""
     parsed = urlparse(url)
     m = re.match(r"^/bundle/([^/]+)/page/(.+)$", parsed.path)
     if not m:
@@ -171,78 +160,31 @@ def bundle_url_to_api(url: str) -> tuple[str, str] | None:
     return f"{BASE_API}/api/bundle/{bundle_id}/page/{nav_path}", bundle_id
 
 
-@app.list_tools()
-async def list_tools() -> list[Tool]:
-    return [
-        Tool(
-            name="search_pi_docs",
-            description="Search AVEVA PI System documentation (scoped to docs.aveva.com/category/pi-system). Returns titles, URLs, and excerpts.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search terms, e.g. 'Kerberos authentication' or 'configure PI Interface buffering'"},
-                    "n_results": {"type": "integer", "description": "Results to return (default 5, max 20)", "default": 5},
-                    "bundle": {"type": "string", "description": "Optional bundle ID to restrict search, e.g. 'pi-web-api', 'af-sdk', 'pi-server-f'"},
-                },
-                "required": ["query"],
-            },
-        ),
-        Tool(
-            name="get_page",
-            description="Fetch the text of a PI System documentation page by URL.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "docs.aveva.com page URL from search_pi_docs"},
-                    "max_chars": {"type": "integer", "description": "Max characters to return (default 4000, max 12000)", "default": 4000},
-                },
-                "required": ["url"],
-            },
-        ),
-        Tool(
-            name="list_pi_bundles",
-            description="List all PI System documentation bundles grouped by product area.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-    ]
+# ── Tools ──────────────────────────────────────────────────────────────────────
 
+@mcp.tool()
+async def search_pi_docs(
+    query: Annotated[str, "Search terms, e.g. 'Kerberos authentication' or 'configure PI Interface buffering'"],
+    n_results: Annotated[int, "Results to return (default 5, max 20)"] = 5,
+    bundle: Annotated[str, "Optional bundle ID to restrict search, e.g. 'pi-web-api', 'af-sdk', 'pi-server-f'"] = "",
+) -> str:
+    """Search AVEVA PI System documentation (scoped to docs.aveva.com/category/pi-system).
 
-@app.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    client = get_client()
-    try:
-        if name == "search_pi_docs":
-            return await _search(client, arguments)
-        elif name == "get_page":
-            return await _get_page(client, arguments)
-        elif name == "list_pi_bundles":
-            return _list_bundles()
-        else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
-    except httpx.HTTPStatusError as e:
-        return [TextContent(type="text", text=f"API error {e.response.status_code}: {e.request.url}")]
-    except httpx.RequestError as e:
-        return [TextContent(type="text", text=f"Network error: {e}")]
+    Returns titles, URLs, and excerpts.
+    """
+    n = min(n_results, 20)
+    bundle = bundle.strip()
 
-
-async def _search(client: httpx.AsyncClient, args: dict) -> list[TextContent]:
-    query = args["query"]
-    n = min(int(args.get("n_results", 5)), 20)
-    bundle = args.get("bundle", "").strip()
-
-    # Fetch up to 50 results and post-filter by the PI System bundle whitelist.
-    # We do NOT use labels= because it skews ranking unpredictably;
-    # the whitelist alone provides accurate category scoping.
     fetch_n = 50 if not bundle else n
-    params: dict[str, Any] = {"q": query, "results_per_page": fetch_n}
+    params: dict = {"q": query, "results_per_page": fetch_n}
     if bundle:
         params["bundle"] = bundle
 
+    client = get_client()
     resp = await client.get(f"{BASE_API}/api/search", params=params)
     resp.raise_for_status()
     data = resp.json()
 
-    # Filter to PI System bundles only (unless user specified a bundle explicitly)
     raw_results = data.get("Results", [])
     if bundle:
         results = raw_results[:n]
@@ -253,7 +195,7 @@ async def _search(client: httpx.AsyncClient, args: dict) -> list[TextContent]:
         ][:n]
 
     if not results:
-        return [TextContent(type="text", text=f"No PI System results for: {query}")]
+        return f"No PI System results for: {query}"
 
     lines: list[str] = []
     for i, item in enumerate(results, 1):
@@ -269,28 +211,33 @@ async def _search(client: httpx.AsyncClient, args: dict) -> list[TextContent]:
         if snippet:
             lines.append(f"   {snippet}")
 
-    return [TextContent(type="text", text="\n".join(lines))]
+    return "\n".join(lines)
 
 
-async def _get_page(client: httpx.AsyncClient, args: dict) -> list[TextContent]:
-    url = args["url"]
-    max_chars = min(int(args.get("max_chars", 4000)), 12000)
+@mcp.tool()
+async def get_page(
+    url: Annotated[str, "docs.aveva.com page URL from search_pi_docs"],
+    max_chars: Annotated[int, "Max characters to return (default 4000, max 12000)"] = 4000,
+) -> str:
+    """Fetch the text of a PI System documentation page by URL."""
+    max_chars = min(max_chars, 12000)
 
     parsed = bundle_url_to_api(url)
     if not parsed:
-        return [TextContent(type="text", text=f"Invalid URL: {url}\nExpected: https://docs.aveva.com/bundle/<id>/page/<path>")]
+        return f"Invalid URL: {url}\nExpected: https://docs.aveva.com/bundle/<id>/page/<path>"
 
-    api_url, bundle_id = parsed
+    api_url, _ = parsed
+    client = get_client()
     try:
         resp = await client.get(api_url)
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:
-        return [TextContent(type="text", text=f"Page not found (HTTP {e.response.status_code}): {url}")]
+        return f"Page not found (HTTP {e.response.status_code}): {url}"
 
     data = resp.json()
     topic_html = data.get("topic_html", "")
     if not topic_html:
-        return [TextContent(type="text", text="Page content not available.")]
+        return "Page content not available."
 
     title = data.get("title", "")
     bundle_title = data.get("bundle_title", "")
@@ -302,14 +249,15 @@ async def _get_page(client: httpx.AsyncClient, args: dict) -> list[TextContent]:
 
     header = f"# {title} — {bundle_title} (updated {updated})\n{url}\n\n"
     suffix = "\n\n[truncated — increase max_chars for more]" if truncated else ""
+    return header + content + suffix
 
-    return [TextContent(type="text", text=header + content + suffix)]
 
-
-def _list_bundles() -> list[TextContent]:
+@mcp.tool()
+def list_pi_bundles() -> str:
+    """List all PI System documentation bundles grouped by product area."""
     global _bundle_list_cache
     if _bundle_list_cache is not None:
-        return [TextContent(type="text", text=_bundle_list_cache)]
+        return _bundle_list_cache
 
     lines = [f"PI System bundles ({len(PI_SYSTEM_BUNDLES)} total) — docs.aveva.com/category/pi-system\n"]
     lines.append("Pass a bundle ID as the `bundle` param in search_pi_docs to scope results.\n")
@@ -318,13 +266,10 @@ def _list_bundles() -> list[TextContent]:
             lines.append(f"{group_name}: {', '.join(ids)}")
 
     _bundle_list_cache = "\n".join(lines)
-    return [TextContent(type="text", text=_bundle_list_cache)]
+    return _bundle_list_cache
 
 
-async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
-
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    mcp.run()
