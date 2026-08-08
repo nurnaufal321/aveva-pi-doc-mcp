@@ -1,4 +1,4 @@
-# PI Doc MCP
+# Aveva PI Doc MCP
 
 **Ground your AI answers in live AVEVA PI System documentation.**
 
