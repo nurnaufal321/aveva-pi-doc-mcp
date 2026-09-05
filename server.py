@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 import httpx
 from bs4 import BeautifulSoup
 from mcp.server.mcpserver.server import MCPServer
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
 BASE_API = "https://docs-be.aveva.com"
 
@@ -127,7 +129,24 @@ _BUNDLE_GROUPS: list[tuple[str, list[str]]] = [
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
-mcp = MCPServer("pi-doc-mcp")
+# Every tool here reads public documentation over the network: no side effects,
+# and results depend on what AVEVA currently publishes.
+READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=True)
+
+mcp = MCPServer(
+    "pi-doc-mcp",
+    instructions=(
+        "Answers questions about the AVEVA PI System from the official product "
+        "documentation at docs.aveva.com. Use search_pi_docs to find pages, then "
+        "get_page to read one in full — search excerpts are short and usually omit "
+        "the actual procedure. list_pi_bundles gives the bundle IDs that scope a "
+        "search to one product. Prefer these tools over recalled knowledge: PI "
+        "System details are version-specific and easy to misremember. Everything "
+        "is scoped to docs.aveva.com/category/pi-system, so other AVEVA product "
+        "families are deliberately excluded. All tools are read-only and need no "
+        "credentials."
+    ),
+)
 _client: httpx.AsyncClient | None = None
 _bundle_list_cache: str | None = None
 
@@ -162,16 +181,43 @@ def bundle_url_to_api(url: str) -> tuple[str, str] | None:
 
 # ── Tools ──────────────────────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool(
+    description=(
+        "Search the official AVEVA PI System documentation and return page "
+        "titles, bundle IDs, URLs and matching excerpts.\n\n"
+        "Use this for how the PI System works and how to configure it: PI Data "
+        "Archive, Asset Framework, PI Vision, interfaces and connectors, PI Web "
+        "API, AF SDK, PI SQL and DataLink. Reach for it before answering from "
+        "memory — PI behaviour, defaults and menu paths differ between versions. "
+        "For a specific error message or a known issue, a support knowledge base "
+        "is a better source than product manuals, if one is available.\n\n"
+        "Read-only; no side effects; no credentials needed. Results are restricted "
+        "to docs.aveva.com/category/pi-system, so System Platform, CONNECT and "
+        "other AVEVA families never appear. Excerpts are a couple of lines and "
+        "routinely omit the procedure itself — follow up with get_page on the URL "
+        "that looks right."
+    ),
+    annotations=READ_ONLY,
+)
 async def search_pi_docs(
-    query: Annotated[str, "Search terms, e.g. 'Kerberos authentication' or 'configure PI Interface buffering'"],
-    n_results: Annotated[int, "Results to return (default 5, max 20)"] = 5,
-    bundle: Annotated[str, "Optional bundle ID to restrict search, e.g. 'pi-web-api', 'af-sdk', 'pi-server-f'"] = "",
+    query: Annotated[str, Field(description=(
+        "Search terms describing the task or setting, e.g. 'Kerberos "
+        "authentication' or 'configure PI Interface buffering'. Plain keywords "
+        "work better than a full question."
+    ))],
+    n_results: Annotated[int, Field(
+        default=5, ge=1, le=20,
+        description="Number of results to return, 1-20.",
+    )] = 5,
+    bundle: Annotated[str, Field(
+        default="",
+        description=(
+            "Optional bundle ID restricting the search to one product, e.g. "
+            "'pi-web-api', 'af-sdk' or 'pi-server-f'. Call list_pi_bundles for "
+            "valid IDs. Leave empty to search all PI System documentation."
+        ),
+    )] = "",
 ) -> str:
-    """Search AVEVA PI System documentation (scoped to docs.aveva.com/category/pi-system).
-
-    Returns titles, URLs, and excerpts.
-    """
     n = min(n_results, 20)
     bundle = bundle.strip()
 
@@ -214,12 +260,34 @@ async def search_pi_docs(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(
+    description=(
+        "Fetch one AVEVA PI System documentation page and return its text.\n\n"
+        "Use this after search_pi_docs on any result whose excerpt looks relevant "
+        "— excerpts rarely contain the actual steps, so do not answer from a "
+        "search result alone. Also accepts a docs.aveva.com bundle URL the user "
+        "pastes.\n\n"
+        "Read-only; no side effects; no credentials needed. Only accepts URLs of "
+        "the form docs.aveva.com/bundle/<id>/page/<path>; anything else returns a "
+        "message saying so rather than failing. Output is a header with the page "
+        "title, bundle and last-updated date, then the page text truncated at "
+        "max_chars with a marker when cut."
+    ),
+    annotations=READ_ONLY,
+)
 async def get_page(
-    url: Annotated[str, "docs.aveva.com page URL from search_pi_docs"],
-    max_chars: Annotated[int, "Max characters to return (default 4000, max 12000)"] = 4000,
+    url: Annotated[str, Field(description=(
+        "Full documentation URL, normally copied from a search result, e.g. "
+        "'https://docs.aveva.com/bundle/pi-web-api/page/help/getting-started.html'."
+    ))],
+    max_chars: Annotated[int, Field(
+        default=4000, ge=500, le=12000,
+        description=(
+            "Maximum characters of page text to return, 500-12000. Raise it if "
+            "the output ends in a truncation marker."
+        ),
+    )] = 4000,
 ) -> str:
-    """Fetch the text of a PI System documentation page by URL."""
     max_chars = min(max_chars, 12000)
 
     parsed = bundle_url_to_api(url)
@@ -252,9 +320,20 @@ async def get_page(
     return header + content + suffix
 
 
-@mcp.tool()
+@mcp.tool(
+    description=(
+        "List the PI System documentation bundle IDs, grouped by product area.\n\n"
+        "Use this when a search returns results spanning unrelated products and "
+        "you need the exact bundle ID to narrow it, or when the user names a "
+        "product informally ('PI AF', 'the web API') and you need the ID that "
+        "search_pi_docs expects. Not needed for a first, unscoped search.\n\n"
+        "Read-only; no side effects; no network call — the list is static and "
+        "cached. Returns bundle IDs grouped under headings such as PI Server, PI "
+        "Web API, AF SDK and Adapters."
+    ),
+    annotations=READ_ONLY,
+)
 def list_pi_bundles() -> str:
-    """List all PI System documentation bundles grouped by product area."""
     global _bundle_list_cache
     if _bundle_list_cache is not None:
         return _bundle_list_cache
